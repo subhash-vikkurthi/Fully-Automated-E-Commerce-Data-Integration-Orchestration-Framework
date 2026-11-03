@@ -1,0 +1,520 @@
+use database ecommerce_pipeline;
+
+create schema GOLD_LAYER;
+
+use schema GOLD_LAYER;
+
+-- Designing Star-Schema for Dimensional Modelling
+
+create OR REPLACE table DIM_PRODUCTS(
+product_id int autoincrement  start 101 increment 1,
+product_category varchar(20),
+product_name varchar(20)
+);
+
+
+-- creating table to store Customer Details
+
+create OR replace table DIM_CUSTOMERS(
+customer_id varchar(15),
+customer_name varchar(25),
+age int,
+gender varchar(15),
+region varchar(20),
+city varchar(20),
+START_DATE TIMESTAMP,
+END_DATE TIMESTAMP,
+IS_CURRENT BOOLEAN
+);
+
+
+
+
+-- creating table to store order_details
+
+create or replace table DIM_ORDERS(
+order_id varchar(10),
+order_date date,
+payment_method varchar(20),
+return_flag boolean,
+order_status varchar(15),
+START_DATE date,
+END_DATE date,
+IS_CURRENT BOOLEAN
+);
+
+
+-- Creating fact_table to store sales_data
+
+create or replace table FACT_SALES_DETAILS(
+order_id varchar(15),
+customer_id varchar(15),
+product_id int,
+quantity int,
+unit_price decimal(10,2),
+discount_pct decimal(6,2),
+total_amount decimal(10,2),
+profit decimal(10,2),
+shipping_cost decimal(6,2),
+customer_satisfaction int,
+days_to_ship int
+);
+
+
+create or replace procedure INSERT_INTO_DIM_PRODUCT()
+returns string
+language sql
+as
+$$
+declare
+TABLE_NAME STRING;
+PROCEDURE_NAME STRING;
+ACTION_TYPE STRING;
+TOTAL_ROWS_READ INT default 0;
+TOTAL_ROWS_INSERTED INT DEFAULT 0;
+TOTAL_ROWS_UPDATED INT DEFAULT 0;
+PIPE_STATUS STRING;
+START_TIME TIMESTAMP;
+END_TIME TIMESTAMP;
+TO_GET_USER STRING;
+ERROR_MESSAGE STRING;
+begin
+
+START_TIME := CURRENT_TIMESTAMP();
+
+TO_GET_USER := current_user();
+TABLE_NAME := 'DIM_PRODUCTS';
+ACTION_TYPE := 'INSERT';
+PROCEDURE_NAME := 'INSERT_INTO_DIM_PRODUCT';
+
+SELECT COUNT(*) INTO TOTAL_ROWS_READ FROM (SELECT DISTINCT PRODUCT_CATEGORY,PRODUCT_NAME FROM ECOMMERCE_PIPELINE.SILVER_LAYER.silver_stagging);
+
+MERGE INTO DIM_PRODUCTS AS target
+USING (SELECT DISTINCT product_category,PRODUCT_NAME FROM ECOMMERCE_PIPELINE.SILVER_LAYER.silver_stagging) AS source
+ON target.PRODUCT_CATEGORY = source.product_category AND target.PRODUCT_NAME = source.product_name
+
+WHEN NOT MATCHED THEN
+    INSERT(product_category,PRODUCT_NAME) VALUES
+    (source.product_category, source.product_name);
+ 
+
+TOTAL_ROWS_INSERTED := SQLROWCOUNT;
+
+
+END_TIME := CURRENT_TIMESTAMP();
+
+call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME, :ACTION_TYPE, :TOTAL_ROWS_READ,:TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'SUCCESS', :START_TIME, :END_TIME, Null, :TO_GET_USER);
+
+return 'Transformation Completed'||
+        'ROWS READ: ' || TOTAL_ROWS_READ ||
+        ', ROWS INSERTED: ' || TOTAL_ROWS_INSERTED;;
+
+exception
+when other then
+    END_TIME := CURRENT_TIMESTAMP();
+    ERROR_MESSAGE := sqlerrm;
+
+call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME , :ACTION_TYPE, :TOTAL_ROWS_READ, :TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'FAILED', :START_TIME, :END_TIME, :ERROR_MESSAGE, :TO_GET_USER);
+    
+    return 'Transformation Failed' || :ERROR_MESSAGE;
+end;
+$$;
+
+
+CALL INSERT_INTO_DIM_PRODUCT();
+
+
+CREATE OR REPLACE PROCEDURE auditing_pipeline(
+    TABLE_NAME STRING,
+    FILE_NAME STRING,
+    procedure_name STRING,
+    ACTION_TYPE STRING,
+    TOTAL_ROWS_READ INT,
+    TOTAL_ROWS_INSERTED INT,
+    TOTAL_ROWS_UPDATED INT,
+    LOADED_TIME_PIPE TIMESTAMP,
+    PIPE_STATUS STRING,
+    START_TIME TIMESTAMP,
+    END_TIME TIMESTAMP,
+    ERROR_MESSAGE STRING,
+    TO_GET_USER STRING
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+    INSERT INTO ECOMMERCE_PIPELINE.BRONZE_LAYER.AUDIT_TABLE
+    (TABLE_NAME,FILE_NAME,procedure_name,ACTION_TYPE,ROWS_READ,ROWS_INSERTED,ROWS_UPDATED,INITIATED_TIME,STATUS,START_TIME,END_TIME,ERROR_MESSAGE,INITIATED_BY)
+    VALUES
+(:TABLE_NAME,:FILE_NAME,:procedure_name,:ACTION_TYPE,:TOTAL_ROWS_READ,:TOTAL_ROWS_INSERTED,:TOTAL_ROWS_UPDATED,:LOADED_TIME_PIPE,:PIPE_STATUS,:START_TIME,:END_TIME,:ERROR_MESSAGE,:TO_GET_USER);
+
+    RETURN 'Audit Recorded';
+
+END;
+$$;
+
+SELECT * FROM ECOMMERCE_PIPELINE.BRONZE_LAYER.AUDIT_TABLE;
+
+
+CREATE OR REPLACE PROCEDURE INSERT_INTO_DIM_CUSTOMERS()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+TABLE_NAME STRING;
+PROCEDURE_NAME STRING;
+ACTION_TYPE STRING;
+TOTAL_ROWS_READ INT default 0;
+TOTAL_ROWS_INSERTED INT DEFAULT 0;
+TOTAL_ROWS_UPDATED INT DEFAULT 0;
+PIPE_STATUS STRING;
+START_TIME TIMESTAMP;
+END_TIME TIMESTAMP;
+TO_GET_USER STRING;
+ERROR_MESSAGE STRING;
+END_DATE_SCD date;
+
+BEGIN
+
+    -- Capture one timestamp for the entire batch
+    START_TIME := CURRENT_TIMESTAMP();
+
+    TO_GET_USER := 'VIKKURTHI_SUBHASH';
+
+    END_DATE_SCD := CURRENT_DATE();
+
+    TABLE_NAME := 'DIM_CUSTOMERS';
+
+    PROCEDURE_NAME := 'INSERT_INTO_DIM_CUSTOMERS';
+
+    select count(*) into TOTAL_ROWS_READ from (select distinct customer_id from  ECOMMERCE_PIPELINE.SILVER_LAYER.silver_stagging);
+
+    ACTION_TYPE := 'INSERT & SCD-2';
+
+
+
+    -- STEP 1: Prepare deduplicated customer source
+    CREATE OR REPLACE TEMP TABLE CUSTOMER_SOURCE AS
+    SELECT CUSTOMER_ID,CUSTOMER_NAME,AGE,GENDER,REGION,CITY
+    FROM ECOMMERCE_PIPELINE.SILVER_LAYER.silver_stagging
+    WHERE CUSTOMER_ID IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER ( PARTITION BY CUSTOMER_ID ORDER BY NEW_ORDER_DATE DESC ) = 1;
+
+
+    -- STEP 2: Start transaction
+    BEGIN TRANSACTION;
+
+
+    -- STEP 3: Expire changed customer records
+    UPDATE DIM_CUSTOMERS D
+    SET
+        END_DATE = :END_DATE_SCD,
+        IS_CURRENT = FALSE
+    FROM CUSTOMER_SOURCE S
+    WHERE D.CUSTOMER_ID = S.CUSTOMER_ID
+      AND D.IS_CURRENT = TRUE
+      AND ( D.CUSTOMER_NAME IS DISTINCT FROM S.CUSTOMER_NAME
+          OR D.CITY IS DISTINCT FROM S.CITY );
+
+    TOTAL_ROWS_UPDATED := SQLROWCOUNT;
+
+
+    -- STEP 4: Insert new and changed customer records
+    INSERT INTO DIM_CUSTOMERS ( CUSTOMER_ID,CUSTOMER_NAME,AGE,GENDER,REGION,CITY,START_DATE,END_DATE,IS_CURRENT)
+    SELECT S.CUSTOMER_ID,S.CUSTOMER_NAME,S.AGE,S.GENDER,S.REGION,S.CITY,:START_TIME,NULL,TRUE FROM CUSTOMER_SOURCE S
+    LEFT JOIN DIM_CUSTOMERS D
+         ON S.CUSTOMER_ID = D.CUSTOMER_ID
+         AND D.IS_CURRENT = TRUE
+    WHERE D.CUSTOMER_ID IS NULL;
+
+    TOTAL_ROWS_INSERTED := SQLROWCOUNT;
+
+
+    -- STEP 5: Commit transaction
+    COMMIT;
+
+    END_TIME := CURRENT_TIMESTAMP();    
+
+    call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME, :ACTION_TYPE, :TOTAL_ROWS_READ,:TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'SUCCESS', :START_TIME, :END_TIME, Null, :TO_GET_USER);
+
+
+    RETURN
+        'SCD TYPE 2 COMPLETED SUCCESSFULLY. ' ||
+        'ROWS UPDATED: ' || TOTAL_ROWS_UPDATED ||
+        ', ROWS INSERTED: ' || TOTAL_ROWS_INSERTED;
+
+
+EXCEPTION
+    WHEN OTHER THEN
+    Error_message := SQLERRM;
+        ROLLBACK;
+
+        call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME , :ACTION_TYPE, :TOTAL_ROWS_READ, :TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'FAILED', :START_TIME, :END_TIME, :ERROR_MESSAGE, :TO_GET_USER);
+
+        RETURN 'SCD TYPE 2 FAILED: ' || SQLERRM;
+
+END;
+$$;
+
+CALL INSERT_INTO_DIM_CUSTOMERS();
+
+SELECT * FROM ECOMMERCE_PIPELINE.BRONZE_LAYER.AUDIT_TABLE;
+
+
+
+CREATE OR REPLACE PROCEDURE INSERT_INTO_DIM_ORDERS()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+TABLE_NAME STRING;
+PROCEDURE_NAME STRING;
+ACTION_TYPE STRING;
+TOTAL_ROWS_READ INT default 0;
+TOTAL_ROWS_INSERTED INT DEFAULT 0;
+TOTAL_ROWS_UPDATED INT DEFAULT 0;
+PIPE_STATUS STRING;
+START_TIME TIMESTAMP;
+END_TIME TIMESTAMP;
+TO_GET_USER STRING;
+ERROR_MESSAGE STRING;
+END_DATE_SCD date;
+
+BEGIN
+
+    -- Capture one timestamp for the entire batch
+    START_TIME := CURRENT_TIMESTAMP();
+
+    TO_GET_USER := 'VIKKURTHI_SUBHASH';
+
+    END_DATE_SCD := CURRENT_DATE();
+
+    TABLE_NAME := 'DIM_ORDERS';
+
+    PROCEDURE_NAME := 'INSERT_INTO_DIM_ORDERS';
+
+    select count(*) into TOTAL_ROWS_READ from (select distinct customer_id from  ECOMMERCE_PIPELINE.SILVER_LAYER.SILVER_STAGGING);
+
+    ACTION_TYPE := 'INSERT & SCD-2';
+
+
+    -- STEP 1: Prepare deduplicated customer source
+    CREATE OR REPLACE TEMP TABLE ORDER_SOURCE AS
+    SELECT order_id,NEW_ORDER_DATE,payment_method,return_flag,order_status
+    FROM ECOMMERCE_PIPELINE.SILVER_LAYER.SILVER_STAGGING
+    WHERE order_id IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER ( PARTITION BY order_id ORDER BY NEW_ORDER_DATE DESC ) = 1;
+
+
+    -- STEP 2: Start transaction
+    BEGIN TRANSACTION;
+
+    -- STEP 3: Expire changed customer records
+update dim_orders o
+set
+end_date = :END_DATE_SCD,
+is_current = false
+from ORDER_SOURCE s
+where o.order_id = s.order_id
+and o.is_current = true 
+and (o.order_status IS DISTINCT FROM s.order_status or o.order_date IS DISTINCT FROM s.NEW_order_date);
+
+
+TOTAL_ROWS_UPDATED := SQLROWCOUNT;
+
+
+-- STEP 4: Insert new and changed customer records
+MERGE INTO DIM_ORDERS D USING 
+ORDER_SOURCE s
+ON D.ORDER_ID = s.ORDER_ID
+AND D.IS_CURRENT = TRUE
+
+WHEN NOT MATCHED THEN 
+    INSERT(order_id,ORDER_DATE,payment_method,return_flag,order_status,START_DATE,END_DATE,IS_CURRENT)
+    VALUES( S.order_id,S.NEW_ORDER_DATE,S.payment_method,S.return_flag,S.order_status,:END_DATE_SCD,NULL,TRUE);
+
+    TOTAL_ROWS_INSERTED := SQLROWCOUNT;
+
+
+    -- STEP 5: Commit transaction
+    COMMIT;
+
+    END_TIME := CURRENT_TIMESTAMP();    
+
+    call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME, :ACTION_TYPE, :TOTAL_ROWS_READ,:TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'SUCCESS', :START_TIME, :END_TIME, Null, :TO_GET_USER);
+
+
+    RETURN
+        'SCD TYPE 2 COMPLETED SUCCESSFULLY. ' ||
+        'ROWS UPDATED: ' || TOTAL_ROWS_UPDATED ||
+        ', ROWS INSERTED: ' || TOTAL_ROWS_INSERTED;
+
+
+EXCEPTION
+    WHEN OTHER THEN
+    Error_message := SQLERRM;
+        ROLLBACK;
+
+        call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME , :ACTION_TYPE, :TOTAL_ROWS_READ, :TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'FAILED', :START_TIME, :END_TIME, :ERROR_MESSAGE, :TO_GET_USER);
+
+        RETURN 'SCD TYPE 2 FAILED: ' || SQLERRM;
+
+END;
+$$;
+
+CALL INSERT_INTO_DIM_ORDERS();
+
+
+
+
+create or replace procedure INSERT_INTO_FACT_SALES_DETAILS()
+returns string
+language sql
+as
+$$
+declare
+TABLE_NAME STRING;
+PROCEDURE_NAME STRING;
+ACTION_TYPE STRING;
+TOTAL_ROWS_READ INT default 0;
+TOTAL_ROWS_INSERTED INT DEFAULT 0;
+TOTAL_ROWS_UPDATED INT DEFAULT 0;
+PIPE_STATUS STRING;
+START_TIME TIMESTAMP;
+END_TIME TIMESTAMP;
+TO_GET_USER STRING;
+ERROR_MESSAGE STRING;
+begin
+
+START_TIME := CURRENT_TIMESTAMP();
+
+TO_GET_USER := current_user();
+TABLE_NAME := 'FACT_SALES_DETAILS';
+ACTION_TYPE := 'INSERT';
+PROCEDURE_NAME := 'INSERT_INTO_FACT_SALES_DETAILS';
+
+SELECT COUNT(*) INTO TOTAL_ROWS_READ FROM ECOMMERCE_PIPELINE.SILVER_LAYER.SILVER_STAGGING;
+
+MERGE INTO FACT_SALES_DETAILS AS target
+USING (SELECT order_id,customer_id,product_id,quantity,unit_price,SALES_AMOUNT,profit,shipping_cost,customer_satisfaction,days_to_ship FROM ECOMMERCE_PIPELINE.SILVER_LAYER.SILVER_STAGGING S
+LEFT JOIN ECOMMERCE_PIPELINE.GOLD_LAYER.DIM_PRODUCTS P
+ON P.PRODUCT_NAME = S.PRODUCT_NAME) AS source
+ON target.order_id = source.order_id
+
+WHEN NOT MATCHED THEN
+INSERT(order_id,customer_id,product_id,quantity,unit_price,total_amount,profit,shipping_cost,customer_satisfaction,days_to_ship) VALUES
+(source.order_id,source.customer_id,source.product_id,source.quantity,source.unit_price,source.SALES_AMOUNT,source.profit,source.shipping_cost,source.customer_satisfaction,source.days_to_ship);
+ 
+
+TOTAL_ROWS_INSERTED := SQLROWCOUNT;
+
+
+END_TIME := CURRENT_TIMESTAMP();
+
+call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME, :ACTION_TYPE, :TOTAL_ROWS_READ,:TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'SUCCESS', :START_TIME, :END_TIME, Null, :TO_GET_USER);
+
+return 'Transformation Completed' ||
+        'ROWS READ: ' || TOTAL_ROWS_READ ||
+        ', ROWS INSERTED: ' || TOTAL_ROWS_INSERTED;
+
+exception
+when other then
+    END_TIME := CURRENT_TIMESTAMP();
+    ERROR_MESSAGE := sqlerrm;
+
+call auditing_pipeline(:TABLE_NAME, NULL,:PROCEDURE_NAME , :ACTION_TYPE, :TOTAL_ROWS_READ, :TOTAL_ROWS_INSERTED , :TOTAL_ROWS_UPDATED, :START_TIME, 'FAILED', :START_TIME, :END_TIME, :ERROR_MESSAGE, :TO_GET_USER);
+    
+    return 'Transformation Failed' || SQLERRM;
+end;
+$$;
+
+
+
+
+CALL INSERT_INTO_DIM_ORDERS();
+CALL INSERT_INTO_DIM_CUSTOMERS();
+CALL INSERT_INTO_DIM_PRODUCT();
+CALL INSERT_INTO_FACT_SALES_DETAILS();
+
+
+create or replace procedure TO_DESIGN_GOLD_SCHEMA()
+returns string
+language sql
+as
+$$
+declare
+TABLE_NAME STRING;
+PROCEDURE_NAME STRING;
+ACTION_TYPE STRING;
+START_TIME TIMESTAMP;
+TO_GET_USER STRING;
+ERROR_MESSAGE STRING;
+begin
+
+START_TIME := CURRENT_TIMESTAMP();
+
+
+TO_GET_USER := 'VIKKURTHI SUBHASH';
+TABLE_NAME := 'SILVER_ORDERS_DATA';
+ACTION_TYPE := 'UPDATE';
+PROCEDURE_NAME := 'TO_DESIGN_GOLD_SCHEMA';
+
+CALL INSERT_INTO_DIM_ORDERS();
+CALL INSERT_INTO_DIM_CUSTOMERS();
+CALL INSERT_INTO_DIM_PRODUCT();
+CALL INSERT_INTO_FACT_SALES_DETAILS();
+
+
+
+CALL SYSTEM$SEND_EMAIL(
+    'alert_user',
+    'subhashv9966@gmail.com',
+    'Regarding_MicroBatchin_Pipeline',
+    'FROM_USER : ' || :TO_GET_USER || CHAR(10) ||
+    'TABLE_NAME : ' || :TABLE_NAME || CHAR(10) ||
+    'PROCEDURE_NAME : ' || :PROCEDURE_NAME || CHAR(10) ||
+    'ERROR_MESSAGE : ' || 'NULL' || CHAR(10) ||
+    'STATUS : ' || 'SUCCESS');
+
+    return 'Transformed Sucessfully';
+
+exception
+when other then
+    ERROR_MESSAGE := sqlerrm;
+    
+    CALL SYSTEM$SEND_EMAIL(
+    'alert_user',
+    'subhashv9966@gmail.com',
+    'Regarding_MicroBatchin_Pipeline',
+    'FROM_USER : ' || :TO_GET_USER || CHAR(10) ||
+    'TABLE_NAME : ' || :TABLE_NAME || CHAR(10) ||
+    'PROCEDURE_NAME : ' || :PROCEDURE_NAME || CHAR(10) ||
+    'ERROR_MESSAGE : ' || COALESCE(:sqlerrm, 'NA') || CHAR(10) ||
+    'STATUS : ' || 'FAILED');
+
+        return 'Transformation Failed ' || Error_message;
+
+
+end;
+$$;
+
+CALL TO_DESIGN_GOLD_SCHEMA();
+
+SELECT * FROM ECOMMERCE_PIPELINE.BRONZE_LAYER.AUDIT_TABLE
+where procedure_name = 'INSERT_INTO_DIM_ORDERS';
+
+SELECT * FROM DIM_ORDERS;
+
+SELECT * FROM DIM_CUSTOMERS;
+
+SELECT * FROM DIM_PRODUCTS;
+
+SELECT * FROM FACT_SALES_DETAILS;
+
+
+
+SELECT * FROM BRONZE_LAYER.AUDIT_TABLE;
